@@ -14,7 +14,9 @@ export default function App() {
   useEffect(() => {
     if (!autoSyncEnabled) {
       const fetchTemp = async () => {
-        const response = await fetch(`${import.meta.env.VITE_API_URL}/predict`, {
+
+        const BASE_URL = import.meta.env.VITE_API_URL || 'http://localhost:8000';
+        const response = await fetch(`${BASE_URL}/predict`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           // CHANGE THIS: Match the names in your main.py ForwardInput class
