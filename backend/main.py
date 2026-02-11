@@ -8,6 +8,11 @@ import os
 
 app = FastAPI()
 
+origins = [
+    "http://localhost:5173",
+    "https://cdse-xray-diffraction-thermometry.onrender.com", 
+]
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
