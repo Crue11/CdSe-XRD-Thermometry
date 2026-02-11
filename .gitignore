@@ -1,0 +1,14 @@
+# Python
+__pycache__/
+.venv/
+venv/
+*.pyc
+
+# Node / React
+node_modules/
+dist/
+.env
+
+# MacOS/Windows junk
+.DS_Store
+Thumbs.db
