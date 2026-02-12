@@ -54,47 +54,53 @@ export default function App() {
   };
 
   return (
-    <div className="min-h-screen w-full bg-gradient-to-br from-zinc-950 via-zinc-900 to-zinc-950 p-6">
+    <div className="min-h-screen w-full bg-gradient-to-br from-zinc-950 via-zinc-900 to-zinc-950 p-4 md:p-6">
       <div className="max-w-[1600px] mx-auto">
-        {/* Main Header */}
-        <div className="mb-6">
-          <h1 className="text-4xl font-bold text-white font-mono tracking-wider mb-2">
+
+        {/* Header - Center on mobile, left-align on desktop */}
+        <div className="mb-6 text-center md:text-left">
+          <h1 className="text-2xl md:text-4xl font-bold text-white font-mono tracking-wider mb-2">
             CdSe X-Ray Diffraction Thermometry
           </h1>
-          <p className="text-zinc-400 font-mono text-sm">
+          <p className="text-zinc-400 font-mono text-xs md:text-sm">
             Real-time Temperature Prediction & Peak Analysis System
           </p>
         </div>
 
-        {/* AI RESULT CARD */}
-        <div className="mb-6 bg-zinc-900 border border-cyan-500/30 p-4 rounded-xl w-fit">
-          <p className="text-cyan-500 text-xs font-mono uppercase tracking-widest">AI Prediction</p>
-          <p className="text-4xl text-white font-mono">{(aiTemp || 0).toFixed(2)} °C</p>
+        {/* AI Result Card - Full width on mobile */}
+        <div className="mb-6 bg-zinc-900 border border-cyan-500/30 p-4 rounded-xl w-full md:w-fit text-center md:text-left">
+          <p className="text-cyan-500 text-[10px] font-mono uppercase tracking-widest mb-1">AI Prediction</p>
+          <p className="text-3xl md:text-4xl text-white font-mono">{(aiTemp || 0).toFixed(2)} °C</p>
         </div>
 
-        {/* Main Content */}
-        <div className="flex gap-6">
-          {/* Interactive Graph Section */}
-          <InteractiveGraph
-            peakPosition={peakPosition}
-            peakWidth={peakWidth}
-            peakHeight={peakHeight}
-            predictedTemp={aiTemp}
-          />
+        {/* Main Content: Column on mobile, Row on desktop */}
+        <div className="flex flex-col lg:flex-row gap-6">
 
-          {/* Control Panel Section */}
-          <GlassmorphicControlPanel
-            peakPosition={peakPosition}
-            peakWidth={peakWidth}
-            peakHeight={peakHeight}
-            currentTemp={aiTemp}
-            onPeakPositionChange={setPeakPosition}
-            onPeakWidthChange={setPeakWidth}
-            onPeakHeightChange={setPeakHeight}
-            onTemperatureChange={handleTempChange}
-            autoSyncEnabled={autoSyncEnabled}
-            onAutoSyncToggle={setAutoSyncEnabled}
-          />
+          {/* Interactive Graph - Takes full width on mobile, shrinks on desktop */}
+          <div className="w-full lg:flex-1 order-1 lg:order-1">
+            <InteractiveGraph
+              peakPosition={peakPosition}
+              peakWidth={peakWidth}
+              peakHeight={peakHeight}
+              predictedTemp={aiTemp}
+            />
+          </div>
+
+          {/* Control Panel - Stacks below graph on mobile */}
+          <div className="w-full lg:w-80 order-2 lg:order-2 flex justify-center">
+            <GlassmorphicControlPanel
+              peakPosition={peakPosition}
+              peakWidth={peakWidth}
+              peakHeight={peakHeight}
+              currentTemp={aiTemp}
+              onPeakPositionChange={setPeakPosition}
+              onPeakWidthChange={setPeakWidth}
+              onPeakHeightChange={setPeakHeight}
+              onTemperatureChange={handleTempChange}
+              autoSyncEnabled={autoSyncEnabled}
+              onAutoSyncToggle={setAutoSyncEnabled}
+            />
+          </div>
         </div>
       </div>
     </div>
