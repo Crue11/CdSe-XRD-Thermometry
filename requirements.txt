@@ -1,5 +1,17 @@
+# Web Server
 fastapi
 uvicorn
-joblib
+python-multipart
+
+# Data Science & Physics (The Core Engine)
 pandas
+numpy
+scipy
 scikit-learn
+
+# AI Model Handling
+joblib
+xgboost
+
+# Utilities
+python-dotenv
