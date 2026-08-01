@@ -1,310 +1,301 @@
-from fastapi import FastAPI, HTTPException, File, UploadFile
-from fastapi.responses import FileResponse
-from fastapi.middleware.cors import CORSMiddleware
-from scipy.signal import find_peaks, peak_widths
-from pydantic import BaseModel
-import joblib
-import pandas as pd
+"""
+CdSe XRD Thermometry — web API.
+
+Thin HTTP layer over `pipeline.deploy.ThermometerService`. The user uploads the
+2-column scan their diffractometer already exports; the service extracts the
+13-feature signature, runs the Mahalanobis out-of-distribution check, and either
+returns a temperature or explains why it will not.
+
+Nothing here decides whether a prediction is trustworthy — that judgement lives
+in the service, and this layer only forwards it.
+"""
+from __future__ import annotations
+
+import os
+import sys
+from contextlib import asynccontextmanager
+from pathlib import Path
+from typing import Any, Dict, List, Optional
+
 import numpy as np
 import uvicorn
-import os
-import io
-import re
+from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, Field
 
-app = FastAPI()
+BASE_DIR = Path(__file__).resolve().parent
+sys.path.insert(0, str(BASE_DIR / "pipeline"))
 
-origins = [
-    "http://localhost:5173",
-    "http://127.0.0.1:5173",
-    "https://cdse-xray-diffraction-thermometry.onrender.com",
-]
+from pipeline import cdse_simulator as sim               # noqa: E402
+from pipeline.deploy import ThermometerService           # noqa: E402
+from pipeline.feature_extractor import TARGET_PEAKS      # noqa: E402
+from pipeline.xrd_io import XRDParseError, parse_xrd_bytes  # noqa: E402
+from pipeline.train_forward_models import CURATED_FEATURES  # noqa: E402
+
+# Operating envelope, from report Section 5.3.3 and the deployment README.
+TEMP_MIN_C = 25.0
+TEMP_MAX_C = 400.0
+SCAN_GEOMETRY = "Cu-K-alpha, 20-80 deg 2theta, step 0.02 deg"
+DEFAULT_MODEL = "RandomForest"
+
+# Caglioti U,V,W for instrumental broadening. These are the simulator's values;
+# a real diffractometer should be calibrated against a NIST SRM 660 LaB6
+# standard and the result set here (report Section 6.4, limitation 4).
+# Set XRD_CAGLIOTI_UVW="U,V,W", or "none" to skip deconvolution entirely.
+def _caglioti_from_env() -> Optional[tuple]:
+    raw = os.environ.get("XRD_CAGLIOTI_UVW", "").strip().lower()
+    if raw in ("none", "off"):
+        return None
+    if raw:
+        try:
+            u, v, w = (float(x) for x in raw.split(","))
+            return (u, v, w)
+        except ValueError:
+            print(f"[warn] Ignoring malformed XRD_CAGLIOTI_UVW={raw!r}")
+    return (0.005, -0.002, 0.010)
+
+
+# Populated at startup. `service` stays None if the artefacts are missing, so
+# the app still serves /health and can say exactly what is wrong.
+service: Optional[ThermometerService] = None
+startup_error: Optional[str] = None
+
+
+@asynccontextmanager
+async def lifespan(_: FastAPI):
+    """Build the service once. Construction loads 8 models and fits the OOD
+    detector (3-5 s); doing it per request would be unusable."""
+    global service, startup_error
+    try:
+        service = ThermometerService(caglioti_UVW=_caglioti_from_env())
+        print(f"Loaded {len(service.models)} models: {sorted(service.models)}")
+        print(f"OOD threshold (Mahalanobis): {service.ood.threshold:.2f}")
+        if service.inverse_model is None:
+            print("[warn] Inverse_ML.joblib missing — the explorer tab will "
+                  "fall back to the physics simulator only.")
+    except Exception as exc:  # noqa: BLE001 - surfaced verbatim via /health
+        startup_error = str(exc)
+        print(f"[error] Thermometry service unavailable: {exc}")
+    yield
+
+
+app = FastAPI(title="CdSe XRD Thermometry", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=origins,
+    allow_origins=[
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
+        "https://cdse-xray-diffraction-thermometry.onrender.com",
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# 1. Initialize model variables
-model_fwd = None
-model_inv = None
-fwhm_estimator = None
-model_calibrated = None
 
-# 2. Dynamic path handling
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-
-# Ensure directories exist
-DATASET_DIR = os.path.join(BASE_DIR, "datasets")
-MODELS_DIR = os.path.join(BASE_DIR, "models")
-os.makedirs(DATASET_DIR, exist_ok=True)
-os.makedirs(MODELS_DIR, exist_ok=True) # Create models folder if missing
-
-# Paths
-model_fwd_path = os.path.join(MODELS_DIR, "model_fwd.joblib")
-model_inv_path = os.path.join(MODELS_DIR, "model_inv.joblib")
-fwhm_model_path = os.path.join(MODELS_DIR, "fwhm_estimator_rf_final.joblib")
-
-# THE KEY VARIABLE
-CALIBRATED_MODEL_PATH = os.path.join(MODELS_DIR, "calibrated_model.joblib")
-
-# Datasets
-PHENO_FILE = os.path.join(DATASET_DIR, "Extracted_Phenotypes.csv")
-AUG_FILE = os.path.join(DATASET_DIR, "CdSe_Augmented_Dataset.csv")
-
-# Reference Room Temperature Position
-RT_PEAK_REF = 25.64
-
-try:
-    if os.path.exists(model_fwd_path) and os.path.exists(model_inv_path):
-        model_fwd = joblib.load(model_fwd_path)
-        model_inv = joblib.load(model_inv_path)
-        print("✅ Primary AI Models loaded successfully.")
-
-    if os.path.exists(fwhm_model_path):
-        fwhm_estimator = joblib.load(fwhm_model_path)
-        print("✅ FWHM Estimator loaded successfully.")
-    else:
-        print(f"❌ ERROR: FWHM model not found in {fwhm_model_path}")
-
-except Exception as e:
-    print(f"❌ ERROR loading models: {e}")
+def _require_service() -> ThermometerService:
+    if service is None:
+        raise HTTPException(
+            status_code=503,
+            detail=f"Thermometry service unavailable: {startup_error}",
+        )
+    return service
 
 
-class ForwardInput(BaseModel):
-    pos: float
-    intensity: float
-    fwhm: float
-    use_calibrated: bool = False
+# -----------------------------------------------------------------------------
+# Health
+# -----------------------------------------------------------------------------
 
-
-class InverseInput(BaseModel):
-    temp: float
-
-
-class FWHMInput(BaseModel):
-    pos: float
-    intensity: float
-
-
-def extract_phenotype(df, temp):
-    # Ensure data is valid before processing
-    if df.empty or 'intensity' not in df.columns:
-        return None
-
-    peak_indices, _ = find_peaks(df['intensity'], height=100, distance=50)
-    if len(peak_indices) == 0:
-        return None
-
-    main_peak_idx = peak_indices[df['intensity'].iloc[peak_indices].argmax()]
-    pos = df['twotheta'].iloc[main_peak_idx]
-    intensity = df['intensity'].iloc[main_peak_idx]
-
-    results_half = peak_widths(df['intensity'], [main_peak_idx], rel_height=0.5)
-    res_width = results_half[0][0]
-
-    # Calculate spacing safely
-    if len(df) > 1:
-        spacing = df['twotheta'].iloc[1] - df['twotheta'].iloc[0]
-    else:
-        spacing = 0.02  # Default fallback
-
-    fwhm = res_width * spacing
-
+@app.get("/health")
+def health() -> Dict[str, Any]:
+    """What the UI needs to describe the system honestly before any upload."""
+    if service is None:
+        return {
+            "ready": False,
+            "error": startup_error,
+            "models": [],
+            "hint": "Place the trained .joblib artefacts in backend/models/ "
+                    "(RandomForest, GradientBoosting, SVR, KNN, MLP, "
+                    "DecisionTree, GPR, Inverse_ML), or run "
+                    "`python -m pipeline.train_forward_models` from backend/.",
+        }
     return {
-        "Temperature": temp,
-        "Peak_Position": float(pos),
-        "Peak_Intensity": float(intensity),
-        "FWHM": float(fwhm),
-        "Peak_Shift": float(pos - RT_PEAK_REF)
+        "ready": True,
+        "models": sorted(service.models),
+        "default_model": DEFAULT_MODEL,
+        "uncertainty_model": "GPR",
+        # GPR reproduces both the accuracy and the spread recorded in the
+        # report's predictions.csv (mean sigma 13.3 degC against 13.0), so the
+        # interval it reports is meaningful. verify_against_report.py checks
+        # the calibration, not just the mean prediction.
+        "uncertainty_validated": True,
+        "has_inverse_model": service.inverse_model is not None,
+        "ood_threshold": round(float(service.ood.threshold), 2),
+        "n_features": len(service.feature_names),
+        "feature_names": list(service.feature_names),
+        "temperature_range_c": [TEMP_MIN_C, TEMP_MAX_C],
+        "scan_geometry": SCAN_GEOMETRY,
+        "caglioti_UVW": service.caglioti_UVW,
     }
 
 
-@app.post("/predict")
-def predict_temp(data: ForwardInput):
-    selected_model = model_fwd
+# -----------------------------------------------------------------------------
+# Analyse uploaded scans  (A -> B: signature -> temperature)
+# -----------------------------------------------------------------------------
 
-    if data.use_calibrated:
-        global model_calibrated
-        if os.path.exists(CALIBRATED_MODEL_PATH) and model_calibrated is None:
-            model_calibrated = joblib.load(CALIBRATED_MODEL_PATH)
+@app.post("/analyze")
+async def analyze(files: List[UploadFile] = File(...),
+                  model_name: str = DEFAULT_MODEL) -> Dict[str, Any]:
+    """Predict temperature for each uploaded scan.
 
-        if model_calibrated:
-            selected_model = model_calibrated
-        else:
-            raise HTTPException(status_code=400, detail="Calibrated model not found.")
+    One entry per input file, in the order uploaded. A file that cannot be
+    parsed yields a status of "error" rather than vanishing from the results —
+    silent skipping was the previous behaviour and it left users guessing.
+    """
+    svc = _require_service()
+    if model_name not in svc.models:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unknown model {model_name!r}. Available: {sorted(svc.models)}",
+        )
 
-    if selected_model is None:
-        raise HTTPException(status_code=503, detail="AI Model not loaded")
-
-    shift = data.pos - RT_PEAK_REF
-    input_df = pd.DataFrame([[data.pos, data.intensity, data.fwhm, shift]],
-                            columns=["Peak_Position", "Peak_Intensity", "FWHM", "Peak_Shift"])
-
-    prediction = selected_model.predict(input_df)[0]
-    return {"temperature": float(prediction), "model_used": "calibrated" if data.use_calibrated else "base"}
-
-
-@app.post("/simulate")
-def simulate_xrd(data: InverseInput):
-    if model_inv is None:
-        raise HTTPException(status_code=503, detail="AI Model not loaded")
-
-    input_df = pd.DataFrame([[data.temp]], columns=["Temperature"])
-    physics = model_inv.predict(input_df)[0]
-    return {
-        "pos": float(physics[0]),
-        "fwhm": float(physics[1]),
-        "intensity": float(physics[2]),
-    }
-
-
-@app.post("/estimate-fwhm")
-async def predict_fwhm(data: FWHMInput):
-    if fwhm_estimator is None:
-        raise HTTPException(status_code=503, detail="FWHM Estimator not loaded")
-
-    peak_shift = data.pos - RT_PEAK_REF
-    features = np.array([[data.pos, data.intensity, peak_shift]])
-    prediction = fwhm_estimator.predict(features)[0]
-
-    return {
-        "fwhm": float(prediction),
-        "peak_shift": float(peak_shift),
-        "status": "success"
-    }
-
-
-@app.post("/process-batch")
-async def process_batch(files: list[UploadFile] = File(...)):
-    raw_results = []
-    for file in files:
+    results: List[Dict[str, Any]] = []
+    for upload in files:
+        entry: Dict[str, Any] = {"filename": upload.filename}
         try:
-            content = await file.read()
-
-            # 1. Robust Decoding: Try common Lab-Export encodings
-            text_content = None
-            for encoding in ['utf-8-sig', 'latin-1', 'utf-16']:
-                try:
-                    text_content = content.decode(encoding).splitlines()
-                    # Check if it looks like a real XRD file
-                    if any("2Theta" in line for line in text_content[:100]):
-                        break
-                except:
-                    continue
-
-            if not text_content:
-                print(f"Skipping {file.filename}: Encoding error")
-                continue
-
-            # 2. Locate the Numerical Data Block
-            start_line = -1
-            for i, line in enumerate(text_content):
-                # Clean the line for robust matching
-                clean_line = line.strip().replace(" ", "")
-                if "<2Theta>" in clean_line or "2Theta" in clean_line:
-                    start_line = i + 1
-                    break
-
-            if start_line == -1:
-                print(f"Skipping {file.filename}: Could not locate <2Theta> header")
-                continue
-
-            # 3. Extract the Data Block
-            data_string = "\n".join(text_content[start_line:])
-
-            # 4. Read into Pandas with Strict Column Enforcement
-            df = pd.read_csv(
-                io.StringIO(data_string),
-                sep=r'\s+',
-                names=['twotheta', 'intensity'],
-                usecols=[0, 1],  # Force it to only grab the first 2 columns
-                header=None,
-                index_col=False,
-                on_bad_lines='skip',  # Skip metadata rows at the end of the file
-                engine='python'
-            )
-
-            # 5. Cleanup & Feature Extraction
-            df['twotheta'] = pd.to_numeric(df['twotheta'], errors='coerce')
-            df['intensity'] = pd.to_numeric(df['intensity'], errors='coerce')
-            df = df.dropna().reset_index(drop=True)
-
-            if df.empty:
-                continue
-
-            # Filename parsing for Temp
-            temp_match = re.search(r'_(\d+)|_RT', file.filename)
-            temp = 25 if "RT" in file.filename else int(temp_match.group(1)) if temp_match else 25
-
-            features = extract_phenotype(df, temp)
-            if features:
-                features["filename"] = file.filename
-                raw_results.append(features)
-
-        except Exception as e:
-            print(f"Error parsing {file.filename}: {e}")
+            two_theta, intensity = parse_xrd_bytes(await upload.read())
+        except XRDParseError as exc:
+            results.append({**entry, "status": "error", "status_detail": str(exc),
+                            "T_predicted": None, "T_uncertainty": None,
+                            "features": None, "quality_report": None,
+                            "ood_distance": None})
             continue
 
-    if raw_results:
-        df_temp = pd.DataFrame(raw_results)
-        # Drop the 'filename' column for the clean scientific dataset
-        if "filename" in df_temp.columns:
-            df_temp = df_temp.drop(columns=["filename"])
-        df_temp.to_csv(PHENO_FILE, index=False)
-        print(f"✅ Phenotypes saved to: {PHENO_FILE}")
+        result = svc.predict(two_theta, intensity, model_name=model_name)
 
-    return {"results": sorted(raw_results, key=lambda x: x['Temperature'])}
+        # The service computes a temperature before it knows the sample is out
+        # of distribution. Report Section 4.4.3 is explicit that no prediction
+        # is returned in that case, so withhold it here rather than relying on
+        # the client to hide it — an API that still emits the number has not
+        # really implemented the safeguard.
+        if result["status"] == "out_of_distribution":
+            result["T_predicted"] = None
+            result["T_uncertainty"] = None
 
-
-@app.post("/calibrate")
-async def calibrate_model(data: list[dict]):
-    df_base = pd.DataFrame(data)
-    target_samples = 500
-    new_temps = np.linspace(df_base['Temperature'].min(), df_base['Temperature'].max(), target_samples)
-
-    aug_data = pd.DataFrame({'Temperature': new_temps})
-    for col in ['Peak_Position', 'Peak_Intensity', 'FWHM', 'Peak_Shift']:
-        aug_data[col] = np.interp(new_temps, df_base['Temperature'], df_base[col])
-        noise = np.random.normal(0, aug_data[col].std() * 0.01, target_samples)
-        aug_data[col] += noise
-
-    from sklearn.ensemble import RandomForestRegressor
-    X = aug_data[['Peak_Position', 'Peak_Intensity', 'Peak_Shift', 'FWHM']]
-    y = aug_data['Temperature']
-
-    calibrated_rf = RandomForestRegressor(n_estimators=100, random_state=42)
-    calibrated_rf.fit(X, y)
-
-    joblib.dump(calibrated_rf, CALIBRATED_MODEL_PATH)
-
-    global model_calibrated
-    model_calibrated = calibrated_rf
-
-    df_base = pd.DataFrame(data)
-    df_base.to_csv(PHENO_FILE, index=False)
-    aug_data.to_csv(AUG_FILE, index=False)
+        result["scan"] = {
+            "n_points": int(two_theta.size),
+            "two_theta_min": round(float(two_theta.min()), 3),
+            "two_theta_max": round(float(two_theta.max()), 3),
+            "step": round(float(np.median(np.diff(two_theta))), 4),
+            # Downsampled for plotting; the model saw the full array.
+            "preview": _downsample(two_theta, intensity),
+        }
+        results.append({**entry, **result})
 
     return {
-        "status": "success",
-        "message": f"Model saved to {CALIBRATED_MODEL_PATH}",
-        "r2_score": 0.98
+        "results": results,
+        "model_used": model_name,
+        "ood_threshold": round(float(svc.ood.threshold), 2),
     }
 
 
-@app.get("/download-phenotypes")
-async def download_phenotypes():
-    if os.path.exists(PHENO_FILE):
-        return FileResponse(PHENO_FILE, media_type='text/csv', filename="CdSe_Extracted_Phenotypes.csv")
-    raise HTTPException(status_code=404, detail="File not found")
+def _downsample(two_theta: np.ndarray, intensity: np.ndarray,
+                target: int = 900) -> List[Dict[str, float]]:
+    """Thin a scan for display, keeping the local maximum of each bin so that
+    narrow peaks survive (plain striding would drop them)."""
+    n = two_theta.size
+    if n <= target:
+        idx = np.arange(n)
+    else:
+        bins = np.array_split(np.arange(n), target)
+        idx = np.array([b[int(np.argmax(intensity[b]))] for b in bins])
+    return [{"twoTheta": round(float(two_theta[i]), 4),
+             "intensity": round(float(intensity[i]), 2)} for i in idx]
 
-@app.get("/download-augmented")
-async def download_augmented():
-    if os.path.exists(AUG_FILE):
-        return FileResponse(AUG_FILE, media_type='text/csv', filename="CdSe_Augmented_ML_Dataset.csv")
-    raise HTTPException(status_code=404, detail="File not found")
+
+# -----------------------------------------------------------------------------
+# Signature explorer  (B -> A: temperature -> expected signature)
+# -----------------------------------------------------------------------------
+
+class SignatureRequest(BaseModel):
+    temp: float = Field(..., ge=TEMP_MIN_C, le=TEMP_MAX_C)
+    crystallite_size_nm: float = Field(25.0, ge=10.0, le=50.0)
+    microstrain: float = Field(0.002, ge=0.0005, le=0.005)
+
+
+@app.post("/simulate-signature")
+def simulate_signature(req: SignatureRequest) -> Dict[str, Any]:
+    """The reverse direction of the bidirectional design (report Section 4.4.2).
+
+    Returns both branches so the UI can show them together:
+
+    * `peaks`   — the six target reflections derived analytically from the
+      physics model (lattice expansion, Debye-Waller, Caglioti, Williamson-Hall).
+      The frontend synthesises the curve from these.
+    * `ml_features` — the same signature as predicted by the trained inverse
+      model. Agreement between the two is the report's central validation claim.
+    """
+    svc = _require_service()
+    a, c = sim.lattice_parameters_at_T(req.temp)
+    rel_intensity = {(h, k, l): rel for h, k, l, rel in sim.WURTZITE_REFLECTIONS}
+
+    peaks: List[Dict[str, Any]] = []
+    for hkl, _target, _window in TARGET_PEAKS:
+        h, k, l = hkl
+        two_theta = sim.bragg_2theta(sim.d_spacing_wurtzite(h, k, l, a, c))
+        if not np.isfinite(two_theta):
+            continue
+        # Total FWHM: instrumental and microstructural broadening add in
+        # quadrature, matching how simulate_pattern builds a peak.
+        fwhm_micro = sim.williamson_hall_fwhm(
+            two_theta, req.crystallite_size_nm, req.microstrain)
+        fwhm_instr = sim.caglioti_fwhm(two_theta, 0.005, -0.002, 0.010)
+        peaks.append({
+            "hkl": f"({h}{k}{l})",
+            "position": round(float(two_theta), 4),
+            "fwhm": round(float(np.hypot(fwhm_micro, fwhm_instr)), 4),
+            "height": round(float(rel_intensity[hkl]
+                                  * sim.debye_waller_factor(two_theta, req.temp)), 4),
+        })
+
+    response: Dict[str, Any] = {
+        "temperature": req.temp,
+        "lattice": {"a": round(float(a), 4), "c": round(float(c), 4),
+                    "volume": round(float(a * a * c * np.sin(np.radians(60.0))), 4)},
+        "peaks": peaks,
+        "two_theta_range": [sim.SimulatorConfig.two_theta_min,
+                            sim.SimulatorConfig.two_theta_max],
+        "ml_features": None,
+    }
+    if svc.inverse_model is not None:
+        response["ml_features"] = {
+            k: round(v, 4) for k, v in svc.expected_signature(req.temp).items()
+        }
+    return response
+
+
+# -----------------------------------------------------------------------------
+# Reference data for the inspector tab
+# -----------------------------------------------------------------------------
+
+@app.get("/training-stats")
+def training_stats() -> Dict[str, Any]:
+    """Per-feature training mean and standard deviation.
+
+    The inspector shows an extracted signature against these, which is how a
+    user sees *which* features pushed a scan out of distribution.
+    """
+    svc = _require_service()
+    return {
+        "features": [
+            {"name": name,
+             "mean": round(float(svc.feature_means[name]), 4),
+             "std": round(float(svc.feature_stds[name]), 4)}
+            for name in CURATED_FEATURES
+        ],
+        "ood_threshold": round(float(svc.ood.threshold), 2),
+    }
 
 
 if __name__ == "__main__":

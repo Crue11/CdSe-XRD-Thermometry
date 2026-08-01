@@ -12,3 +12,13 @@ dist/
 # MacOS/Windows junk
 .DS_Store
 Thumbs.db
+
+# Editors
+.idea/
+.vscode/
+
+# Machine-local tool permissions (launch.json is shared, this is not)
+.claude/settings.local.json
+
+# Generated directory dumps
+project_tree.txt

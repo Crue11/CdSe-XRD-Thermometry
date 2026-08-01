@@ -1,17 +1,13 @@
-# Web Server
+# Web server
 fastapi
 uvicorn
 python-multipart
 
-# Data Science & Physics (The Core Engine)
-pandas
+# Feature extraction and physics simulator
 numpy
+pandas
 scipy
+
+# Models (GradientBoosting uses HistGradientBoostingRegressor, so no xgboost)
 scikit-learn
-
-# AI Model Handling
 joblib
-xgboost
-
-# Utilities
-python-dotenv
